@@ -61,46 +61,6 @@ def recv_array(socket, flags=0, copy=False, track=False):
     A.reshape(md['shape'])
     return A, md
 
-def make_quad_grid(grid):
-    """create a quad grid based on the grid information"""
-    # Create lookup index
-    nodslice = slice(np.where(grid['nod_type'] == 2)[0].min(),
-                     np.where(grid['nod_type'] == 2)[0].max())
-    n = grid['nodn'][nodslice] # column lookup
-    m = grid['nodm'][nodslice] # row lookup
-    k = grid['nodk'][nodslice] # level lookup
-
-    # pixel boundary lookup
-    Y = grid['ip'][:,m-1,k-1] # rows
-    X = grid['jp'][:,n-1,k-1] # columns
-
-    minpx = 5 # is this fixed?
-
-    # slices
-    Xmin = (X[0,:] - 1)/minpx
-    Xmax = (X[3,:] + 1)/minpx
-    Ymin = (Y[0,:] - 1)/minpx
-    Ymax = (Y[3,:] + 1)/minpx
-
-    # total image size
-    mmax = Xmax.max()
-    nmax = Ymax.max()
-
-    # quad lookup
-    quad_grid = np.ma.empty((mmax,nmax), dtype='int32')
-    quad_grid.mask = True
-
-    slices = np.c_[Xmin, Xmax, Ymin, Ymax]
-    indices = np.arange(k.shape[0])
-
-    # fill single pixel quads separately
-    quad_grid[slices[k==1,0], slices[k==1,2]] = indices[k==1]
-    # fill the bigger quads
-    for i, (xmin, xmax, ymin, ymax) in zip(indices[k>1], slices[k>1]):
-        quad_grid[xmin:xmax, ymin:ymax] = i
-    return quad_grid
-
-
 def make_listenener(ctx, port, data):
     """make a socket that replies to message with the grid"""
     subsock = ctx.socket(zmq.SUB)
@@ -127,19 +87,21 @@ class Provider(object):
         self.epsg = epsg
         self.geotransform = geotransform
 
-        logger.info("Connecting to grid")
-        zmqctx = zmq.Context()
-        reqsock = zmqctx.socket(zmq.REQ)
-        # Blocks until connection is found
-        reqsock.connect("tcp://localhost:{port}".format(port=port+1))
-        reqsock.send("give me the grid")
-        grid = reqsock.recv_pyobj()
-        logger.info("Grid  received")
-        self.quad_grid = make_quad_grid(grid)
-        self.data = {}
 
+        req_port = 5556
+        sub_port = 5558
+        logger.info("Connecting to grid at port {}".format(req_port))
+        ctx = zmq.Context()
+        req = ctx.socket(zmq.REQ)
+        # Blocks until connection is found
+        req.connect("tcp://localhost:{port}".format(port=req_port))
+        req.send("give me the grid")
+        grid = req.recv_pyobj()
+        logger.info("Grid  received")
+        self.data = {}
+        self.grid = grid
         # start listening to data in a background thread
-        make_listenener(zmqctx, port, self.data)
+        make_listenener(ctx, sub_port, self.data)
 
         # Start the model listener
 
@@ -148,12 +110,21 @@ class Provider(object):
         Render the requested variable
         """
 
+        logger.info("width: {width}, height: {height}, srs: {srs}, xmin: {xmin}, ymin: {ymin}, xmax: {xmax}, ymax: {ymax}, zoom: {zoom}".format(**locals()) )
         logger.info("I have variables {}".format(self.data.keys()))
         memdriver = osgeo.gdal.GetDriverByName('MEM')
         tiffdriver = osgeo.gdal.GetDriverByName('GTiff')
 
         # name does not do anything
-        quad_grid = self.quad_grid
+        grid =  self.grid
+        quad_grid = grid['quad_grid']
+        quad_transform= (grid['x0p'],  # xmin
+                         grid['dxp'], # xmax
+                         0,            # for rotation
+                         grid['y0p'],
+                         0,
+                         grid['dyp'])
+
 
         src_ds = memdriver.Create(self.layer.name(),
                                   quad_grid.shape[1],
@@ -163,58 +134,50 @@ class Provider(object):
         if src_ds.GetGCPs():
             src_ds.SetProjection(src_ds.GetGCPProjection())
 
-        grayscale_src = (src_ds.RasterCount == 1)
+        src_ds.SetGeoTransform(quad_transform)
 
-        try:
-            # Prepare output gdal datasource -----------------------------------
+        src_srs = osgeo.osr.SpatialReference()
+        epsg = 22234
+        src_srs.ImportFromEPSG(epsg)
+        src_ds.SetProjection(src_srs.ExportToWkt())
 
-            area_ds = tiffdriver.Create('/vsimem/output', width, height, 3)
+        band = src_ds.GetRasterBand(1)
+        band.WriteArray(quad_grid)
 
-            if area_ds is None:
-                raise Exception('uh oh.')
+        # Prepare output gdal datasource -----------------------------------
+
+        area_ds = tiffdriver.Create('/vsimem/output.tiff', width, height, 1, eType = osgeo.gdal.GDT_Int32)
+
+        if area_ds is None:
+            raise Exception('uh oh.')
 
 
-            merc = osgeo.osr.SpatialReference()
-            merc.ImportFromProj4(srs)
-            area_ds.SetProjection(merc.ExportToWkt())
+        merc = osgeo.osr.SpatialReference()
+        merc.ImportFromProj4(srs)
 
-            # note that 900913 points north and east
-            x, y = xmin, ymax
-            w, h = xmax - xmin, ymin - ymax
+        area_ds.SetProjection(merc.ExportToWkt())
 
-            gtx = [x, w/width, 0, y, 0, h/height]
-            area_ds.SetGeoTransform(gtx)
-            # Adjust resampling method -----------------------------------------
+        w = xmax - xmin
+        h = ymax - ymin
+        gtx = [xmin, w/width, 0, ymin, 0, h/height]
+        area_ds.SetGeoTransform(gtx)
+        band = area_ds.GetRasterBand(1)
+        band.SetNoDataValue(-9999)
+        band.WriteArray(np.zeros((band.YSize, band.XSize))-9999)
 
-            resample = self.resample
 
-            if resample == osgeo.gdal.GRA_CubicSpline:
-                #
-                # I've found through testing that when ReprojectImage is used
-                # on two same-scaled datasources, GDAL will visibly darken the
-                # output and the results look terrible. Switching resampling
-                # from cubic spline to bicubic in these cases fixes the output.
-                #
-                xscale = area_ds.GetGeoTransform()[1] / src_ds.GetGeoTransform()[1]
-                yscale = area_ds.GetGeoTransform()[5] / src_ds.GetGeoTransform()[5]
-                diff = max(abs(xscale - 1), abs(yscale - 1))
+        # Adjust resampling method -----------------------------------------
 
-                if diff < .001:
-                    resample = osgeo.gdal.GRA_Cubic
+        resample = osgeo.gdal.GRA_NearestNeighbour
 
-            # Create rendered area ---------------------------------------------
-            src_sref = osgeo.osr.SpatialReference()
-            src_sref.ImportFromWkt(src_ds.GetProjection())
+        # Create rendered area ---------------------------------------------
 
-            osgeo.gdal.ReprojectImage(src_ds, area_ds, src_ds.GetProjection(), area_ds.GetProjection(), resample)
+        osgeo.gdal.ReprojectImage(src_ds, area_ds, src_ds.GetProjection(), area_ds.GetProjection(), resample, 1000000, 0.1 )
+        data = area_ds.GetRasterBand(1).ReadAsArray()
+        data = np.ma.masked_equal(data, -9999)
+        tiffdriver.Delete('/vsimem/output.tiff')
 
-            channel = grayscale_src and (1, 1, 1) or (1, 2, 3)
-            r, g, b = [area_ds.GetRasterBand(i).ReadRaster(0, 0, width, height) for i in channel]
-
-            data = ''.join([''.join(pixel) for pixel in zip(r, g, b)])
-            area = Image.fromstring('RGB', (width, height), data)
-
-        finally:
-            tiffdriver.Delete('/vsimem/output')
+        print data.dtype, data.shape
+        area = Image.fromstring('RGBA', (width, height), data)
 
         return area
