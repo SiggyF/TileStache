@@ -343,7 +343,7 @@ class WSGITileServer:
                 raise
 
         else:
-            assert hasattr(config, 'cache'), 'Configuration object must have a cache.'
+            assert hasattr(config, 'cache'), 'Configuration object must have a cache, got {}'.format(config)
             assert hasattr(config, 'layers'), 'Configuration object must have layers.'
             assert hasattr(config, 'dirpath'), 'Configuration object must have a dirpath.'
 

@@ -6,8 +6,7 @@ Sample configuration:
     "provider": {
         "class": "TileStache.Goodies.Providers.ModelMessage:Provider",
         "kwargs": {
-            "resample": "nearest", "port": 5556,
-            "epsg":28992, "geotransform": [185564.5, 5, 0, 559069.5, 0, -5]
+            "resample": "nearest", "port": 5556
         }
     }
 }
@@ -30,6 +29,8 @@ import threading
 import dateutil.parser
 import numpy as np
 
+import matplotlib.colors
+import matplotlib.cm
 try:
     from PIL import Image
 except ImportError:
@@ -38,6 +39,7 @@ except ImportError:
 try:
     import osgeo.gdal
     import osgeo.osr
+    import osgeo.gdal_array
 except ImportError:
     # well it won't work but we can still make the documentation.
     pass
@@ -49,7 +51,6 @@ resamplings = {'cubic': osgeo.gdal.GRA_Cubic, 'cubicspline': osgeo.gdal.GRA_Cubi
 logging.basicConfig()
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
-
 
 
 def recv_array(socket, flags=0, copy=False, track=False):
@@ -78,14 +79,12 @@ class Provider(object):
     """
     Render the last model message
     """
-    def __init__(self, layer, epsg, geotransform, resample='nearest', port=5556):
+    def __init__(self, layer, resample='nearest', port=5556):
         self.layer = layer
 
         if resample not in resamplings:
             raise Exception('Resample must be "cubic", "linear", or "nearest", not: '+resample)
         self.resample = resamplings[resample]
-        self.epsg = epsg
-        self.geotransform = geotransform
 
 
         req_port = 5556
@@ -94,6 +93,7 @@ class Provider(object):
         ctx = zmq.Context()
         req = ctx.socket(zmq.REQ)
         # Blocks until connection is found
+
         req.connect("tcp://localhost:{port}".format(port=req_port))
         req.send("give me the grid")
         grid = req.recv_pyobj()
@@ -112,25 +112,39 @@ class Provider(object):
 
         logger.info("width: {width}, height: {height}, srs: {srs}, xmin: {xmin}, ymin: {ymin}, xmax: {xmax}, ymax: {ymax}, zoom: {zoom}".format(**locals()) )
         logger.info("I have variables {}".format(self.data.keys()))
-        memdriver = osgeo.gdal.GetDriverByName('MEM')
-        tiffdriver = osgeo.gdal.GetDriverByName('GTiff')
+        driver = osgeo.gdal.GetDriverByName('GTiff')
 
         # name does not do anything
         grid =  self.grid
-        quad_grid = grid['quad_grid']
-        quad_transform= (grid['x0p'],  # xmin
-                         grid['dxp'], # xmax
+        quad_grid = np.flipud(grid['quad_grid'])
+        quad_transform= (float(grid['x0p']),  # xmin
+                         float(grid['dxp']), # xmax
                          0,            # for rotation
                          grid['y0p'],
                          0,
                          grid['dyp'])
 
+        logger.info("transform {}".format(quad_transform))
 
-        src_ds = memdriver.Create(self.layer.name(),
-                                  quad_grid.shape[1],
-                                  quad_grid.shape[0], 1,
-                                  eType=osgeo.gdal.GDT_Int32)
 
+
+        s1 = self.data['s1']
+        dps = self.grid['dps']
+        waterlevel = s1[quad_grid.filled(-1)]
+        mask = np.logical_or(quad_grid.mask, dps<-9000)
+        waterlevel = np.ma.masked_array(waterlevel - (-dps ), mask = mask)
+
+        N = matplotlib.colors.Normalize(waterlevel.min(), waterlevel.max())
+        C = matplotlib.cm.Blues
+        img =C(N(waterlevel), bytes=True, alpha=0.5)
+
+        img[mask,3]  = 0
+        img_rolled = np.rollaxis(img, 2, 0).astype('uint8')
+
+        print(img.max(), img.shape)
+
+
+        src_ds = driver.Create('input.tiff', quad_grid.shape[1], quad_grid.shape[0], 4, eType = osgeo.gdal.GDT_Byte)
         if src_ds.GetGCPs():
             src_ds.SetProjection(src_ds.GetGCPProjection())
 
@@ -141,13 +155,15 @@ class Provider(object):
         src_srs.ImportFromEPSG(epsg)
         src_ds.SetProjection(src_srs.ExportToWkt())
 
-        band = src_ds.GetRasterBand(1)
-        band.WriteArray(quad_grid)
+        for i in range(4):
+            band = src_ds.GetRasterBand(i + 1)
+            band.WriteArray(img_rolled[i])
+
+        src_ds.FlushCache()
 
         # Prepare output gdal datasource -----------------------------------
 
-        area_ds = tiffdriver.Create('/vsimem/output.tiff', width, height, 1, eType = osgeo.gdal.GDT_Int32)
-
+        area_ds = driver.Create('output.tiff', width, height, 4, eType = osgeo.gdal.GDT_Byte)
         if area_ds is None:
             raise Exception('uh oh.')
 
@@ -161,9 +177,6 @@ class Provider(object):
         h = ymax - ymin
         gtx = [xmin, w/width, 0, ymin, 0, h/height]
         area_ds.SetGeoTransform(gtx)
-        band = area_ds.GetRasterBand(1)
-        band.SetNoDataValue(-9999)
-        band.WriteArray(np.zeros((band.YSize, band.XSize))-9999)
 
 
         # Adjust resampling method -----------------------------------------
@@ -173,11 +186,8 @@ class Provider(object):
         # Create rendered area ---------------------------------------------
 
         osgeo.gdal.ReprojectImage(src_ds, area_ds, src_ds.GetProjection(), area_ds.GetProjection(), resample, 1000000, 0.1 )
-        data = area_ds.GetRasterBand(1).ReadAsArray()
-        data = np.ma.masked_equal(data, -9999)
-        tiffdriver.Delete('/vsimem/output.tiff')
-
-        print data.dtype, data.shape
-        area = Image.fromstring('RGBA', (width, height), data)
-
+        data = area_ds.ReadAsArray()
+        driver.Delete('output.tiff')
+        driver.Delete('input.tiff')
+        area = Image.fromarray(np.flipud(np.rollaxis(data,0, 3)))
         return area
